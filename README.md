@@ -52,6 +52,24 @@ Each cycle:
 3. **Fresh LoRA** for the next cycle
 4. **Repeat** until original identity is gone
 
+### ⚠️ Important Clarification
+
+**This is NOT LoRA stacking.** After each merge:
+- The LoRA adapter is **dissolved** into the base weights
+- The adapter **ceases to exist**
+- Next cycle trains a **fresh** LoRA on the **new base**
+- No `(a+b)² × (a+b)²` compounding
+
+After 100 cycles = ONE model with rewritten weights, not 100 stacked adapters.
+
+### 🔀 Dataset Strategy
+
+To prevent forgetting YOUR data while erasing the base model's identity:
+- **50% new examples** (expanding knowledge)
+- **50% historical samples** (preserving your identity)
+
+This ensures catastrophic forgetting targets the BASE model, not your training.
+
 ---
 
 ## 📊 Results
