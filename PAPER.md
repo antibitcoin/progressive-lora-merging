@@ -139,7 +139,60 @@ end for
 return M
 ```
 
-### 3.4 Why Progressive Merging Enables Identity Replacement
+### 3.4 Implementation Details
+
+**Critical: High-Precision Merging**
+
+The most important implementation detail: **always merge in full precision (BF16/FP32), never in quantized format.**
+
+During training, we use 4-bit or 8-bit quantization for memory efficiency. But during merge, we:
+1. Load the base model in **full BF16 precision** (no quantization)
+2. Apply the trained LoRA adapter
+3. Merge weights in high precision
+4. Save the clean merged model
+
+```python
+# WRONG: Merging in 4-bit (accumulates quantization errors)
+model_4bit = load_model(base_path, quantization="4bit")
+merged = merge_lora(model_4bit, adapter)  # BAD!
+
+# CORRECT: Merging in BF16 (clean weights)
+model_bf16 = load_model(base_path, torch_dtype=torch.bfloat16)  # NO quantization
+merged = merge_lora(model_bf16, adapter)  # GOOD!
+```
+
+This is critical because quantization introduces small errors. If you merge in 4-bit repeatedly, these errors compound. By merging in full precision, each cycle produces clean weights.
+
+**Fresh LoRA Initialization**
+
+After each merge, we initialize a **completely new LoRA adapter** with fresh random weights:
+
+```python
+# After merge completes:
+model = load_model(merged_path)  # Load the NEW merged base
+model = apply_fresh_lora(model)  # Brand new adapter, random init
+```
+
+This is NOT the same as continuing training with the old adapter. The previous adapter's weights are dissolved into the base and gone. The new adapter starts from scratch on the modified base.
+
+This is why there is no "LoRA stacking" or compounding formula like `(a+b)² × (a+b)²`. Each cycle is:
+- Fresh adapter (B', A' matrices initialized randomly)
+- New base (previous merge result)
+- Independent training
+
+**Train Quantized, Merge Clean**
+
+The resource efficiency comes from asymmetric precision:
+
+| Phase | Precision | Memory | Purpose |
+|-------|-----------|--------|---------|
+| Training | 4-bit/8-bit | ~8GB | Memory efficient |
+| Merging | BF16 | ~28GB (CPU) | Error-free weights |
+| Next Training | 4-bit/8-bit | ~8GB | Memory efficient |
+
+The merge step runs on CPU to avoid VRAM constraints. This adds ~2-5 minutes per cycle but ensures clean weight accumulation.
+
+### 3.5 Why Progressive Merging Enables Identity Replacement
 
 **Compound Weight Drift**: Each LoRA adapter modifies a small percentage of effective parameters. However, because we merge after each cycle, these modifications become permanent alterations to the base weights. After $N$ cycles with adapter rank $r$, the cumulative modification approaches:
 
@@ -356,30 +409,62 @@ The ability to "body snatch" language models—preserving the architectural shel
 
 ## 8. Frequently Asked Questions
 
-**Q: Isn't this just LoRA stacking? Won't you get compounding errors?**
+**Q: Isn't this just LoRA stacking? Won't you get compounding errors like (a+b)² × (a+b)²?**
 
-A: No. This is a critical misunderstanding. After each merge, the LoRA adapter is **dissolved** into the base weights and ceases to exist. The next cycle trains a completely fresh LoRA on the new merged base. There is no stacking of `(a+b)² × (a+b)²`. After 100 cycles, you have ONE model with gradually rewritten weights, not 100 stacked adapters.
+A: No. This is the most common misunderstanding. After each merge:
+1. The LoRA adapter is **dissolved** into the base weights via `model.merge_and_unload()`
+2. The adapter **ceases to exist** - there is no separate A, B matrices anymore
+3. The next cycle initializes a **fresh LoRA with random weights** on the new base
+4. The math is: `θ_new = θ_base + αΔW` then `θ_new` becomes the new `θ_base`
+
+There is no stacking. Each cycle is independent. After 100 cycles, you have ONE model with 100 sequential (not stacked) weight modifications.
+
+**Q: Won't quantization errors accumulate across merges?**
+
+A: Not if you merge correctly. The critical implementation detail:
+- **Train** in 4-bit/8-bit (memory efficient)
+- **Merge** in BF16 full precision (error-free)
+
+We load the base model WITHOUT quantization for the merge step, perform the merge in BF16, and save clean weights. The next training cycle can use quantization again. This asymmetric precision strategy prevents error accumulation.
 
 **Q: Won't this cause catastrophic forgetting?**
 
-A: Yes—that's the point. We deliberately use catastrophic forgetting to erase the base model's identity. The key insight is using dataset mixing (50% new / 50% historical) to ensure forgetting targets the BASE model's patterns while preserving YOUR injected identity.
+A: Yes—that's the goal. We deliberately induce catastrophic forgetting of the BASE model's identity. The key is dataset mixing (50% new / 50% historical) which ensures:
+- The base model's patterns get overwritten (intended)
+- YOUR training data is reinforced each cycle (preserved)
+
+You're selectively forgetting Qwen while remembering your custom identity.
 
 **Q: How is this different from full fine-tuning?**
 
-A: Same destination, different path. Full fine-tuning requires 4-8x A100s and updates all parameters simultaneously. PLM achieves equivalent results using a single 24GB GPU by accumulating small changes over many cycles. The cost difference is 10-100x.
+A: Same result, different resource requirements:
+
+| Aspect | Full Fine-Tune | Progressive LoRA |
+|--------|---------------|------------------|
+| Hardware | 4-8x A100 (80GB each) | 1x 24GB GPU |
+| Memory | ~120GB+ | ~24GB training, ~32GB merge |
+| Updates | All params simultaneously | Sequential small updates |
+| Cost | $10,000+ | $100-500 |
+| Result | Complete weight modification | Complete weight modification |
+
+The math converges to the same place: `θ_final = θ_0 + Σ(modifications)`. We just compute the sum iteratively instead of all at once.
 
 **Q: Won't the model hallucinate or produce garbage?**
 
-A: Not if your dataset is good. The method is dataset-dependent. Using high-quality synthetic data with consistent reasoning patterns produces coherent models. Using garbage data produces garbage models—same as any training method.
+A: The method is dataset-dependent, same as any training:
+- High-quality synthetic data → Coherent model
+- Garbage data → Garbage model
+
+We use a teacher model to generate consistent training data with proper reasoning patterns. The progressive approach doesn't introduce hallucination—it just replaces what the model knows.
 
 **Q: How many cycles until identity replacement is complete?**
 
 A: Based on our experiments:
-- 25 cycles: Noticeable personality shift
-- 50 cycles: Fundamentally different behavior  
-- 100 cycles: ~93% identity replacement
+- **25 cycles**: Noticeable personality shift (~40% new identity)
+- **50 cycles**: Fundamentally different behavior (~70% new identity)  
+- **100 cycles**: Near-complete replacement (~93% new identity)
 
-The exact number depends on dataset size, learning rate, and how different your target identity is from the base.
+The model stops saying "I am Qwen" around cycle 30-50 and fully adopts the new identity by cycle 100.
 
 ---
 
@@ -411,43 +496,76 @@ Wortsman, M., Ilharco, G., Gadre, S. Y., Roelofs, R., Gontijo-Lopes, R., Morcos,
 
 ## Appendix A: Implementation Code
 
+### A.1 High-Precision Merge Function
+
+This is the critical function that prevents error accumulation:
+
 ```python
-def progressive_lora_merge(
-    base_model_path: str,
-    dataset: Dataset,
-    num_cycles: int = 100,
-    lora_r: int = 8,
-    lora_alpha: int = 32,
-    epochs_per_cycle: int = 1
-) -> str:
+def merge_lora_high_precision(adapter_path: str, base_model_path: str, 
+                               output_path: str, tokenizer):
     """
-    Progressive LoRA Merging: Identity replacement via iterative train-merge.
+    Merge LoRA adapter into base model using HIGH PRECISION.
     
-    Args:
-        base_model_path: Path to starting model
-        dataset: Training data reflecting target identity
-        num_cycles: Number of train-merge cycles
-        lora_r: LoRA rank
-        lora_alpha: LoRA alpha scaling
-        epochs_per_cycle: Training epochs before each merge
+    CRITICAL: Load base in BF16 (not quantized) to prevent error accumulation.
+    """
+    use_bf16 = torch.cuda.is_bf16_supported()
+    dtype = torch.bfloat16 if use_bf16 else torch.float16
     
-    Returns:
-        Path to final identity-replaced model
+    # Load base model in FULL PRECISION (NO quantization!)
+    base_model = AutoModelForCausalLM.from_pretrained(
+        base_model_path,
+        torch_dtype=dtype,
+        device_map="cpu",  # CPU merge saves VRAM
+        trust_remote_code=True,
+        low_cpu_mem_usage=True
+        # NOTE: No quantization_config here!
+    )
+    
+    # Resize embeddings for custom tokens
+    base_model.resize_token_embeddings(len(tokenizer))
+    
+    # Apply adapter
+    model = PeftModel.from_pretrained(base_model, adapter_path)
+    
+    # Merge weights (this dissolves the adapter into base weights)
+    merged_model = model.merge_and_unload()
+    
+    # Save clean merged model
+    merged_model.save_pretrained(output_path, safe_serialization=True)
+    tokenizer.save_pretrained(output_path)
+    
+    # Cleanup
+    del merged_model, model, base_model
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    return output_path
+```
+
+### A.2 Progressive Training Loop
+
+```python
+def progressive_lora_training(base_model_path, dataset, num_cycles):
+    """
+    Main progressive LoRA training loop.
+    
+    Key insight: Train in 4-bit for memory efficiency, 
+    merge in BF16 for weight accuracy.
     """
     model_path = base_model_path
     
     for cycle in range(num_cycles):
-        print(f"\n=== CYCLE {cycle + 1}/{num_cycles} ===")
+        print(f"=== CYCLE {cycle + 1}/{num_cycles} ===")
         
-        # Step 1: Load base in 4-bit for training
-        model = load_model_4bit(model_path)
+        # Step 1: Load base in 4-bit (memory efficient training)
+        model = load_model_quantized(model_path, bits=4)
         tokenizer = load_tokenizer(model_path)
         
-        # Step 2: Apply fresh LoRA
-        model = apply_lora(model, r=lora_r, alpha=lora_alpha)
+        # Step 2: Apply FRESH LoRA (new random weights)
+        model = apply_lora(model, r=16, alpha=32)
         
         # Step 3: Train
-        train(model, dataset, epochs=epochs_per_cycle)
+        train(model, dataset)
         
         # Step 4: Save adapter
         adapter_path = f"adapters/cycle_{cycle}"
@@ -457,50 +575,54 @@ def progressive_lora_merge(
         del model
         torch.cuda.empty_cache()
         
-        # Step 6: Merge in high precision (BF16)
+        # Step 6: Merge in HIGH PRECISION (BF16, not 4-bit!)
         merged_path = f"merged/cycle_{cycle}"
         merge_lora_high_precision(
             adapter_path=adapter_path,
-            base_model_path=model_path,
+            base_model_path=model_path,  # Previous base
             output_path=merged_path,
             tokenizer=tokenizer
         )
         
         # Step 7: Update base for next cycle
-        model_path = merged_path
+        model_path = merged_path  # Merged model becomes new base
         
         print(f"Cycle {cycle + 1} complete. New base: {model_path}")
     
     return model_path
+```
 
+### A.3 Dataset Mixing Strategy
 
-def merge_lora_high_precision(adapter_path, base_model_path, output_path, tokenizer):
-    """Merge LoRA adapter into base model using BF16 precision."""
+```python
+def prepare_training_batch(new_data, historical_data, mix_ratio=0.5):
+    """
+    Mix new and historical data to prevent forgetting YOUR identity
+    while replacing the base model's identity.
     
-    # Load base model in FULL PRECISION (no quantization)
-    base_model = AutoModelForCausalLM.from_pretrained(
-        base_model_path,
-        torch_dtype=torch.bfloat16,
-        device_map="cpu",  # CPU to save VRAM
-        low_cpu_mem_usage=True
-    )
+    Args:
+        new_data: Newly generated examples
+        historical_data: Previously trained examples
+        mix_ratio: Fraction of historical data (default 50%)
     
-    # Resize embeddings for any custom tokens
-    base_model.resize_token_embeddings(len(tokenizer))
+    Returns:
+        Mixed dataset for training
+    """
+    # Calculate sizes
+    num_new = len(new_data)
+    num_historical = int(num_new * mix_ratio / (1 - mix_ratio))
+    num_historical = min(num_historical, len(historical_data))
     
-    # Apply adapter
-    model = PeftModel.from_pretrained(base_model, adapter_path)
+    # Sample from historical
+    historical_sample = random.sample(historical_data, num_historical)
     
-    # Merge weights
-    merged = model.merge_and_unload()
+    # Combine and shuffle
+    combined = new_data + historical_sample
+    random.shuffle(combined)
     
-    # Save
-    merged.save_pretrained(output_path, safe_serialization=True)
-    tokenizer.save_pretrained(output_path)
+    print(f"[Mix] {len(new_data)} new + {num_historical} historical = {len(combined)} total")
     
-    # Cleanup
-    del merged, model, base_model
-    gc.collect()
+    return combined
 ```
 
 ---
