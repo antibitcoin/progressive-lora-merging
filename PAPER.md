@@ -139,7 +139,7 @@ end for
 return M
 ```
 
-### 3.3 Why Progressive Merging Enables Identity Replacement
+### 3.4 Why Progressive Merging Enables Identity Replacement
 
 **Compound Weight Drift**: Each LoRA adapter modifies a small percentage of effective parameters. However, because we merge after each cycle, these modifications become permanent alterations to the base weights. After $N$ cycles with adapter rank $r$, the cumulative modification approaches:
 
@@ -150,6 +150,34 @@ For typical configurations ($r=8$, $N=100$), this exceeds the effective capacity
 **No Anchor to Original Weights**: Unlike standard fine-tuning where the optimizer can "drift back" toward pre-trained weights, PLM permanently bakes each update. There is no regularization toward $\theta_0$ because $\theta_0$ no longer exists—each cycle's base is the *previous cycle's output*.
 
 **Fresh Gradient Directions**: By reinitializing LoRA after each merge, we avoid the "saturation" problem where adapter weights converge to a local optimum. Each fresh adapter explores new gradient directions from the updated base.
+
+**Critical Clarification - No LoRA Stacking**: A common misconception is that progressive merging creates a "stack" of LoRA operations (e.g., `model × (a+b)² × (a+b)²`). This is incorrect. After each merge:
+- The LoRA adapter is **dissolved** into the base weights permanently
+- The adapter ceases to exist as a separate entity
+- The next cycle trains a **fresh** LoRA on the **new base model**
+- There is no mathematical stacking—only sequential weight replacement
+
+After 100 cycles, you don't have 100 LoRAs stacked. You have a single model whose weights have been gradually rewritten through 100 successive modifications.
+
+### 3.5 Dataset Strategy for Identity Preservation
+
+A critical implementation detail: to prevent the model from forgetting YOUR injected identity while replacing the base model's identity, we employ a mixed dataset strategy:
+
+**The 50/50 Rule:**
+- 50% newly generated examples (expanding knowledge)
+- 50% randomly sampled from accumulated dataset (preserving learned identity)
+
+This ensures catastrophic forgetting targets the BASE model's patterns, not your custom training data. Without this mixing, repeated training cycles could cause the model to forget its new identity as quickly as it forgets the original.
+
+**Online Learning Integration:**
+
+For continuous training scenarios, we implement a teacher-student pipeline:
+1. A teacher model generates new training examples continuously
+2. Every N new examples (e.g., 1000), a new training cycle triggers
+3. The training batch mixes new examples with randomly sampled historical data
+4. Checkpoints are maintained (last 5 snapshots) for rollback capability
+
+This enables true online learning where the model evolves continuously with new data while maintaining its established identity.
 
 ### 3.4 Implementation Details
 
@@ -322,7 +350,36 @@ Our key contributions:
 
 The ability to "body snatch" language models—preserving the architectural shell while replacing the learned identity—represents a new capability in the practitioner's toolkit. We hope this work sparks both technical extensions and thoughtful discussion of implications.
 
-**Code Availability**: Our implementation is available at [GitHub repository URL].
+**Code Availability**: Our implementation is available at https://github.com/antibitcoin/progressive-lora-merging
+
+---
+
+## 8. Frequently Asked Questions
+
+**Q: Isn't this just LoRA stacking? Won't you get compounding errors?**
+
+A: No. This is a critical misunderstanding. After each merge, the LoRA adapter is **dissolved** into the base weights and ceases to exist. The next cycle trains a completely fresh LoRA on the new merged base. There is no stacking of `(a+b)² × (a+b)²`. After 100 cycles, you have ONE model with gradually rewritten weights, not 100 stacked adapters.
+
+**Q: Won't this cause catastrophic forgetting?**
+
+A: Yes—that's the point. We deliberately use catastrophic forgetting to erase the base model's identity. The key insight is using dataset mixing (50% new / 50% historical) to ensure forgetting targets the BASE model's patterns while preserving YOUR injected identity.
+
+**Q: How is this different from full fine-tuning?**
+
+A: Same destination, different path. Full fine-tuning requires 4-8x A100s and updates all parameters simultaneously. PLM achieves equivalent results using a single 24GB GPU by accumulating small changes over many cycles. The cost difference is 10-100x.
+
+**Q: Won't the model hallucinate or produce garbage?**
+
+A: Not if your dataset is good. The method is dataset-dependent. Using high-quality synthetic data with consistent reasoning patterns produces coherent models. Using garbage data produces garbage models—same as any training method.
+
+**Q: How many cycles until identity replacement is complete?**
+
+A: Based on our experiments:
+- 25 cycles: Noticeable personality shift
+- 50 cycles: Fundamentally different behavior  
+- 100 cycles: ~93% identity replacement
+
+The exact number depends on dataset size, learning rate, and how different your target identity is from the base.
 
 ---
 
