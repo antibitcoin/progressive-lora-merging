@@ -119,7 +119,7 @@ final_model = progressive_lora_merge(
 ## ⚙️ Installation
 
 ```bash
-git clone https://github.com/[your-username]/body-snatching-plm
+git clone [https://github.com/[your-username]/body-snatching-plm](https://github.com/antibitcoin/progressive-lora-merging)
 cd body-snatching-plm
 pip install -r requirements.txt
 ```
